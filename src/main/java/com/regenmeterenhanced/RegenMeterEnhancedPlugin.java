@@ -313,9 +313,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		if (spec == SPEC_FULL)
 		{
 			// The cycle does not run at full energy. It starts over when you spend some.
-			specTicks = 0;
-			specTick = -1;
-			specGap = 0;
+			restartSpecCycle();
 		}
 		else if (delta == SPEC_PER_REGEN)
 		{
@@ -333,16 +331,22 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		{
 			// A pause does not hold the cycle where it stood, it starts it over, so the first energy
 			// after a wave or a floor is always a whole cycle away however far through the pause began
-			specTicks = 0;
-			specTick = -1;
+			restartSpecCycle();
+		}
+		else if (delta != 0 && specTicks + 1 >= cycle)
+		{
+			// Energy spent or drunk on the same tick the cycle pays hides that tenth in the change, so
+			// a cycle that runs out on a tick the energy moved is taken as paid rather than held back
 			specGap = 0;
+			specTick = tick;
+			specTicks = 0;
 		}
 		else
 		{
 			specTicks = advance(specTicks, cycle, true);
 		}
 
-		specialPercentage = Math.max(0d, specTicks / (double) cycle);
+		specialPercentage = clamp(specTicks / (double) cycle);
 		specialHeld = spec != SPEC_FULL && !paused && specTicks >= cycle;
 	}
 
@@ -369,11 +373,23 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		boolean regen = delta > 0 && delta <= amount() && hp <= max && !fed;
 		// Above your maximum the same cycle takes a point back off you instead of putting one on
 		boolean decay = delta == -1 && hp >= max && !hurt;
+		// A point that lands on the same tick as food, a potion or a hit is lost in the change, so a
+		// cycle that runs out on a tick your hitpoints moved for another reason is taken as paid. Held
+		// back instead, one unseen point sits the meter full until the point after it
+		boolean masked = !regen && !decay && hp != max && hpTicks + 1 >= cycle && (delta != 0 || fed || hurt);
 
 		if (regen || decay)
 		{
 			hpMeasured = measure(tick, hpTick, hpGap, hpMeasured);
 			hpGap = hpTick < 0 ? 0 : tick - hpTick;
+			hpTick = tick;
+			hpTicks = 0;
+		}
+		else if (masked)
+		{
+			// A tick that only might have paid cannot time the cycle, so it breaks the run of gaps
+			// rather than being measured as one
+			hpGap = 0;
 			hpTick = tick;
 			hpTicks = 0;
 		}
@@ -383,7 +399,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 			hpTicks = advance(hpTicks, cycle, hp != max);
 		}
 
-		hitpointsPercentage = Math.max(0d, hpTicks / (double) cycle);
+		hitpointsPercentage = clamp(hpTicks / (double) cycle);
 		hitpointsHeld = hp != max && hpTicks >= cycle;
 
 		if (hp == max && !config.showWhenNoChange())
@@ -452,6 +468,15 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		}
 
 		return measured;
+	}
+
+	/**
+	 * Keeps a meter inside its circle. Putting on a hitpoints cape, or measuring a faster cycle than
+	 * was assumed, shortens the cycle under a count already past the new length.
+	 */
+	private static double clamp(double percent)
+	{
+		return Math.max(0d, Math.min(1d, percent));
 	}
 
 	/**
@@ -598,6 +623,17 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		return name != null && name.toLowerCase(Locale.ROOT).contains("max cape");
 	}
 
+	/**
+	 * Puts the special attack cycle back to the start and drops the gap it was being measured from,
+	 * since a cycle that was started over rather than paid cannot time the cycle before it.
+	 */
+	private void restartSpecCycle()
+	{
+		specTicks = 0;
+		specTick = -1;
+		specGap = 0;
+	}
+
 	private void forgetHpCycle()
 	{
 		hpMeasured = 0;
@@ -607,14 +643,15 @@ public class RegenMeterEnhancedPlugin extends Plugin
 
 	private void reset()
 	{
-		hpTicks = -2; // For some reason this makes this accurate
-		specTicks = 0;
+		// Where a login leaves the hitpoints count, carried over from the original meter
+		hpTicks = -2;
 		hpGap = 0;
-		specGap = 0;
 		hpMeasured = 0;
-		specMeasured = 0;
 		hpTick = -1;
-		specTick = -1;
+		restartSpecCycle();
+		specMeasured = 0;
+		hitpointsPercentage = 0;
+		specialPercentage = 0;
 		lastHp = -1;
 		lastSpec = -1;
 		consumeTick = -1;
