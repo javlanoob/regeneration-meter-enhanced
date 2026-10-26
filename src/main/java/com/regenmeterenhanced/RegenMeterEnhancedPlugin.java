@@ -36,6 +36,7 @@ import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.Constants;
 import net.runelite.api.EquipmentInventorySlot;
+import net.runelite.api.Experience;
 import net.runelite.api.GameState;
 import net.runelite.api.Hitsplat;
 import net.runelite.api.HitsplatID;
@@ -85,6 +86,14 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	private static final int SPEC_FULL = 1000;
 	private static final int SPEC_PER_REGEN = 100;
 
+	/**
+	 * The timer a stat boost drains on, which is what carries hitpoints above your maximum back down.
+	 * It is a minute whatever you are wearing: Rapid Heal and the hitpoints cape perk hurry the regen
+	 * along and leave this alone, and the regen bracelet puts up two points at a time and still only
+	 * takes one off.
+	 */
+	private static final int BOOST_CYCLE = 100;
+
 	private static final int REGION_COLOSSEUM = 7216;
 
 	/**
@@ -104,14 +113,21 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	private static final int DOOM_GRACE = 3;
 
 	/**
-	 * Every cycle length either timer is known to run at. A gap between two regens that is not one of
-	 * these is a regen that went unseen rather than a different cycle, so it is never believed.
+	 * Every cycle length the hitpoints timer is known to run at. A gap between two regens that is not
+	 * one of these is a regen that went unseen rather than a different cycle, so it is never believed.
 	 * <p>
-	 * Besides the ordinary rates there is Rejuvenation at about twenty seconds, and the special attack
-	 * rate doubled by Yama's contract of familiar acquisition, which lands on twenty five ticks bare
-	 * and half that with a Lightbearer.
+	 * Besides the ordinary rates there is Rejuvenation at about twenty seconds.
 	 */
-	private static final int[] CYCLES = {HP_CYCLE, HP_CYCLE_FAST, 33, SPEC_CYCLE_LIGHTBEARER, 13, 12};
+	private static final int[] HP_CYCLES = {HP_CYCLE, HP_CYCLE_FAST, 33};
+
+	/**
+	 * Every cycle length the special attack timer is known to run at, kept apart from the hitpoints
+	 * ones: a meter that measured the other one's rate would believe it and run at it.
+	 * <p>
+	 * Besides the ordinary rates there is the rate doubled by Yama's contract of familiar acquisition,
+	 * which lands on twenty five ticks bare and half that with a Lightbearer.
+	 */
+	private static final int[] SPEC_CYCLES = {SPEC_CYCLE, 33, SPEC_CYCLE_LIGHTBEARER, 13, 12};
 
 	@Inject
 	private Client client;
@@ -322,7 +338,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 			doomGone = 0;
 			paused = false;
 
-			specMeasured = measure(tick, specTick, specGap, specMeasured);
+			specMeasured = measure(tick, specTick, specGap, specMeasured, SPEC_CYCLES);
 			specGap = specTick < 0 ? 0 : tick - specTick;
 			specTick = tick;
 			specTicks = 0;
@@ -361,26 +377,37 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	private void tickHitpoints(int tick)
 	{
 		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-		int max = client.getRealSkillLevel(Skill.HITPOINTS);
+		int max = max();
 		int delta = lastHp == -1 ? 0 : hp - lastHp;
 		lastHp = hp;
 
-		int cycle = cycle();
+		// Above your maximum it is the boost timer being counted and not the regen one, so none of what
+		// hurries a regen along is read into it
+		boolean over = hp > max;
+		int cycle = over ? BOOST_CYCLE : cycle();
 		boolean fed = consumeTick >= tick - 1 || healTick >= tick - 1 || dreamTick >= tick - 1;
 		boolean hurt = damageTick >= tick - 1;
 
 		// A regen puts up as many points as the cycle pays, or fewer if that is all the room there is
 		boolean regen = delta > 0 && delta <= amount() && hp <= max && !fed;
-		// Above your maximum the same cycle takes a point back off you instead of putting one on
+		// Above your maximum a point goes off the top instead of going on, on the boost timer
 		boolean decay = delta == -1 && hp >= max && !hurt;
 		// A point that lands on the same tick as food, a potion or a hit is lost in the change, so a
 		// cycle that runs out on a tick your hitpoints moved for another reason is taken as paid. Held
 		// back instead, one unseen point sits the meter full until the point after it
 		boolean masked = !regen && !decay && hp != max && hpTicks + 1 >= cycle && (delta != 0 || fed || hurt);
 
-		if (regen || decay)
+		if (decay)
 		{
-			hpMeasured = measure(tick, hpTick, hpGap, hpMeasured);
+			// A point going off the top runs on the boost timer, so it neither times the regen cycle nor
+			// carries on from a regen that did
+			hpGap = 0;
+			hpTick = -1;
+			hpTicks = 0;
+		}
+		else if (regen)
+		{
+			hpMeasured = measure(tick, hpTick, hpGap, hpMeasured, HP_CYCLES);
 			hpGap = hpTick < 0 ? 0 : tick - hpTick;
 			hpTick = tick;
 			hpTicks = 0;
@@ -406,16 +433,34 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		{
 			hitpointsPercentage = 0;
 		}
-		else if (hp > max)
+		else if (over)
 		{
-			// Show it going down
-			hitpointsPercentage = 1 - hitpointsPercentage;
+			// Show it going down. A point that is due off the top and has not gone leaves the ring full
+			// rather than empty, the way an overdue regen leaves it full, since an empty ring is no ring
+			// at all to look at and there would be no telling the wait from the plugin being off
+			hitpointsPercentage = hitpointsHeld ? 1 : 1 - hitpointsPercentage;
 		}
 
 		if (config.getNotifyBeforeHpRegenSeconds() > 0 && hp < max && notifyThisTick(cycle))
 		{
 			notifier.notify("Your next hitpoint will regenerate soon!");
 		}
+	}
+
+	/**
+	 * The hitpoints you can have. A Last Man Standing game hands you the build's hitpoints without
+	 * touching your experience, and the client works a level out of experience, so it goes on reporting
+	 * your own level while you fight at the build's. Read your own, a whole game on a lesser account
+	 * reads as an overheal that never drains.
+	 */
+	private int max()
+	{
+		if (client.getVarbitValue(VarbitID.BR_INGAME) != 0)
+		{
+			return Experience.MAX_REAL_LEVEL;
+		}
+
+		return client.getRealSkillLevel(Skill.HITPOINTS);
 	}
 
 	/**
@@ -446,7 +491,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	 * agreed on it. A regen that went unseen leaves a gap of its own, and one of those can land on a
 	 * cycle length the game does use, so a single gap is never enough to go on.
 	 */
-	private static int measure(int tick, int lastTick, int lastGap, int measured)
+	private static int measure(int tick, int lastTick, int lastGap, int measured, int[] cycles)
 	{
 		if (lastTick < 0)
 		{
@@ -459,7 +504,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 			return measured;
 		}
 
-		for (int cycle : CYCLES)
+		for (int cycle : cycles)
 		{
 			if (gap == cycle)
 			{
