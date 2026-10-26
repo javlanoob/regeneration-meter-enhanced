@@ -86,14 +86,6 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	private static final int SPEC_FULL = 1000;
 	private static final int SPEC_PER_REGEN = 100;
 
-	/**
-	 * The timer a stat boost drains on, which is what carries hitpoints above your maximum back down.
-	 * It is a minute whatever you are wearing: Rapid Heal and the hitpoints cape perk hurry the regen
-	 * along and leave this alone, and the regen bracelet puts up two points at a time and still only
-	 * takes one off.
-	 */
-	private static final int BOOST_CYCLE = 100;
-
 	private static final int REGION_COLOSSEUM = 7216;
 
 	/**
@@ -381,31 +373,23 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		int delta = lastHp == -1 ? 0 : hp - lastHp;
 		lastHp = hp;
 
-		// Above your maximum it is the boost timer being counted and not the regen one, so none of what
-		// hurries a regen along is read into it
+		// A point goes off the top on the same timer a point goes on, so Rapid Heal and the cape hurry
+		// the drain along the way they hurry the regen along
 		boolean over = hp > max;
-		int cycle = over ? BOOST_CYCLE : cycle();
+		int cycle = cycle();
 		boolean fed = consumeTick >= tick - 1 || healTick >= tick - 1 || dreamTick >= tick - 1;
 		boolean hurt = damageTick >= tick - 1;
 
 		// A regen puts up as many points as the cycle pays, or fewer if that is all the room there is
 		boolean regen = delta > 0 && delta <= amount() && hp <= max && !fed;
-		// Above your maximum a point goes off the top instead of going on, on the boost timer
+		// Above your maximum a point goes off the top instead of going on, on that same timer
 		boolean decay = delta == -1 && hp >= max && !hurt;
 		// A point that lands on the same tick as food, a potion or a hit is lost in the change, so a
 		// cycle that runs out on a tick your hitpoints moved for another reason is taken as paid. Held
 		// back instead, one unseen point sits the meter full until the point after it
 		boolean masked = !regen && !decay && hp != max && hpTicks + 1 >= cycle && (delta != 0 || fed || hurt);
 
-		if (decay)
-		{
-			// A point going off the top runs on the boost timer, so it neither times the regen cycle nor
-			// carries on from a regen that did
-			hpGap = 0;
-			hpTick = -1;
-			hpTicks = 0;
-		}
-		else if (regen)
+		if (regen || decay)
 		{
 			hpMeasured = measure(tick, hpTick, hpGap, hpMeasured, HP_CYCLES);
 			hpGap = hpTick < 0 ? 0 : tick - hpTick;
