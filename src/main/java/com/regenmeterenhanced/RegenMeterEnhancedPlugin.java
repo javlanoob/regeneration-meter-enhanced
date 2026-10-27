@@ -121,6 +121,27 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	 */
 	private static final int[] SPEC_CYCLES = {SPEC_CYCLE, 33, SPEC_CYCLE_LIGHTBEARER, 13, 12};
 
+	/**
+	 * The hitsplats that carry a number which is not hitpoints, so none of them is damage however
+	 * large it is. A point missing off your hitpoints is what damage is read for, and a drain or a
+	 * counter takes none: the Doom of Mokhaiotl alone would otherwise read as being hit every tick,
+	 * since the sanity it drains and the doom it stacks both arrive as splats of their own.
+	 */
+	private static final int[] SPLATS_NOT_HITPOINTS = {
+		HitsplatID.PRAYER_DRAIN,
+		HitsplatID.SANITY_DRAIN,
+		HitsplatID.SANITY_RESTORE,
+		HitsplatID.DOOM,
+		HitsplatID.CYAN_UP,
+		HitsplatID.CYAN_DOWN
+	};
+
+	/**
+	 * What a tick that never happened reads as, kept far enough back that the ticks counted since it
+	 * are never few enough to matter on the first tick after a login.
+	 */
+	private static final int NEVER = Integer.MIN_VALUE / 2;
+
 	@Inject
 	private Client client;
 
@@ -169,11 +190,14 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	private int lastHp = -1;
 	private int lastSpec = -1;
 
+	// Whether this cycle has already been notified about, so a cycle only ever notifies the once
+	private boolean notified;
+
 	// Ticks something other than the timer moved your hitpoints on, so those moves are not read as one
-	private int consumeTick = -1;
-	private int dreamTick = -1;
-	private int healTick = -1;
-	private int damageTick = -1;
+	private int consumeTick = NEVER;
+	private int dreamTick = NEVER;
+	private int healTick = NEVER;
+	private int damageTick = NEVER;
 
 	private boolean lightbearer;
 	private boolean bracelet;
@@ -248,7 +272,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		{
 			healTick = client.getTickCount();
 		}
-		else if (hitsplat.getAmount() > 0)
+		else if (hitsplat.getAmount() > 0 && takesHitpoints(hitsplat.getHitsplatType()))
 		{
 			damageTick = client.getTickCount();
 		}
@@ -355,7 +379,16 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		}
 
 		specialPercentage = clamp(specTicks / (double) cycle);
-		specialHeld = spec != SPEC_FULL && !paused && specTicks >= cycle;
+		specialHeld = spec != SPEC_FULL && specTicks >= cycle;
+
+		if (paused && spec != SPEC_FULL)
+		{
+			// A pause leaves the ring full rather than empty, the way an overdue regen leaves it full:
+			// an empty ring is no ring at all to look at and there would be no telling a wave that has
+			// not started from the plugin having given up
+			specialPercentage = 1;
+			specialHeld = true;
+		}
 	}
 
 	/**
@@ -395,6 +428,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 			hpGap = hpTick < 0 ? 0 : tick - hpTick;
 			hpTick = tick;
 			hpTicks = 0;
+			notified = false;
 		}
 		else if (masked)
 		{
@@ -403,6 +437,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 			hpGap = 0;
 			hpTick = tick;
 			hpTicks = 0;
+			notified = false;
 		}
 		else
 		{
@@ -539,12 +574,22 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		LocalPoint local = player == null ? null : player.getLocalLocation();
 		boolean instance = local != null && view != null && view.isInstance();
 
+		boolean wasColosseum = inColosseum;
+
 		inColosseum = instance
 			&& WorldPoint.fromLocalInstance(client, local).getRegionID() == REGION_COLOSSEUM;
 
 		if (!inColosseum)
 		{
 			waveStarted = false;
+		}
+		else if (!wasColosseum)
+		{
+			// Arriving in the arena says nothing about whether a wave is running, and logging back in
+			// part way through one is the usual way of arriving there, so a wave is taken as running
+			// until a completion message says otherwise. Read the other way about, a login mid wave
+			// leaves the meter paused and blank until the first energy lands a cycle later
+			waveStarted = true;
 		}
 
 		inDoom = instance && inAnyRegion(view, REGIONS_DOOM);
@@ -563,6 +608,19 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		{
 			doomGone++;
 		}
+	}
+
+	private static boolean takesHitpoints(int splat)
+	{
+		for (int other : SPLATS_NOT_HITPOINTS)
+		{
+			if (splat == other)
+			{
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	private static boolean inAnyRegion(WorldView view, int[] regions)
@@ -597,12 +655,28 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		return false;
 	}
 
+	/**
+	 * Whether the warning before a regen is due on this tick. It fires once a cycle, on the first tick
+	 * at or past the one asked for rather than only on that tick exactly: a cycle the count was thrown
+	 * forward in, by a point that landed where it could not be seen, steps straight over it.
+	 */
 	private boolean notifyThisTick(int cycle)
 	{
+		if (notified)
+		{
+			return false;
+		}
+
 		// if the configured duration lies between two ticks, choose the earlier tick
 		final int ticksBeforeHPRegen = cycle - hpTicks;
 		final int notifyTick = (int) Math.ceil(config.getNotifyBeforeHpRegenSeconds() * 1000d / Constants.GAME_TICK_LENGTH);
-		return ticksBeforeHPRegen == notifyTick;
+		if (ticksBeforeHPRegen > notifyTick)
+		{
+			return false;
+		}
+
+		notified = true;
+		return true;
 	}
 
 	private void readWorn(ItemContainer worn)
@@ -674,6 +748,7 @@ public class RegenMeterEnhancedPlugin extends Plugin
 	{
 		// Where a login leaves the hitpoints count, carried over from the original meter
 		hpTicks = -2;
+		notified = false;
 		hpGap = 0;
 		hpMeasured = 0;
 		hpTick = -1;
@@ -683,10 +758,10 @@ public class RegenMeterEnhancedPlugin extends Plugin
 		specialPercentage = 0;
 		lastHp = -1;
 		lastSpec = -1;
-		consumeTick = -1;
-		dreamTick = -1;
-		healTick = -1;
-		damageTick = -1;
+		consumeTick = NEVER;
+		dreamTick = NEVER;
+		healTick = NEVER;
+		damageTick = NEVER;
 		hitpointsHeld = false;
 		specialHeld = false;
 		inColosseum = false;
